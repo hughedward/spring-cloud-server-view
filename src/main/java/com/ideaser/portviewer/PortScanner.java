@@ -57,7 +57,7 @@ public final class PortScanner {
             if (hasSpringBootApplication(module)) {
                 byProfile.put("", new ModulePortInfo(module.getName(), null, "",
                         ModulePortInfo.SPRING_BOOT_DEFAULT_PORT, true, null, null,
-                        "主类检测", null, moduleDir, buildFile, buildFileName));
+                        "主类检测", null, moduleDir, buildFile, buildFileName, null));
             } else {
                 return; // parent aggregator / shared lib — skip
             }
@@ -97,7 +97,7 @@ public final class PortScanner {
                     "", override.port(), false, String.valueOf(override.port()),
                     defaultRow == null ? null : defaultRow.contextPath(),
                     override.configName(), null,
-                    moduleDir, buildFile, buildFileName));
+                    moduleDir, buildFile, buildFileName, override.configName()));
         }
         out.addAll(byProfile.values());
     }
@@ -149,7 +149,7 @@ public final class PortScanner {
         boolean isDefault = cfg.portRaw() == null;
         Integer port = isDefault ? ModulePortInfo.SPRING_BOOT_DEFAULT_PORT : parsePort(cfg.portRaw());
         return new ModulePortInfo(moduleName, cfg.appName(), profile, port, isDefault, cfg.portRaw(),
-                cfg.contextPath(), file.getName(), file, moduleDir, buildFile, buildFileName);
+                cfg.contextPath(), file.getName(), file, moduleDir, buildFile, buildFileName, null);
     }
 
     /** Higher-priority row was merged first; the new row may only fill null fields. */
@@ -171,7 +171,8 @@ public final class PortScanner {
                 contextPath,
                 takeSecondFile ? second.configFileName() : first.configFileName(),
                 takeSecondFile ? second.configFile() : first.configFile(),
-                first.moduleDir(), first.buildFile(), first.buildFileName());
+                first.moduleDir(), first.buildFile(), first.buildFileName(),
+                first.runConfigName());
     }
 
     /** Numeric ports only; placeholders like {@code ${SERVER_PORT}} resolve to null. */

@@ -13,8 +13,17 @@ import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.fileEditor.OpenFileDescriptor;
 import com.intellij.openapi.ide.CopyPasteManager;
 import com.intellij.ProjectTopics;
+import com.intellij.execution.ExecutionManager;
+import com.intellij.execution.Executor;
+import com.intellij.execution.ProgramRunnerUtil;
+import com.intellij.execution.RunManager;
 import com.intellij.execution.RunManagerListener;
 import com.intellij.execution.RunnerAndConfigurationSettings;
+import com.intellij.execution.executors.DefaultRunExecutor;
+import com.intellij.execution.process.ProcessEvent;
+import com.intellij.execution.process.ProcessHandler;
+import com.intellij.execution.process.ProcessListener;
+import com.intellij.execution.ui.RunContentDescriptor;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.roots.ModuleRootEvent;
@@ -56,6 +65,7 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
 
     private static final int REFRESH_DEBOUNCE_MS = 400;
     private static final int STATUS_POLL_MS = 5000;
+    private static final int RESTART_DELAY_MS = 600;
     private static final JBColor RUNNING_GREEN = new JBColor(0x1E8E3E, 0x57C36A);
     private static final int APP_NAME_COLUMN = PortsTableModel.APP_NAME_COLUMN;
     private static final int PORT_COLUMN = PortsTableModel.PORT_COLUMN;
@@ -92,6 +102,7 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     private final JBLabel statusLabel = new JBLabel("扫描中…");
     private final Alarm refreshAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
     private final Alarm statusAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
+    private final Alarm restartAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
 
     public PortsPanel(@NotNull Project project) {
         super(true, true);
@@ -146,6 +157,10 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         DefaultActionGroup group = new DefaultActionGroup();
         group.add(new RefreshAction());
         group.addSeparator();
+        group.add(new StartAction());
+        group.add(new StopAction());
+        group.add(new RestartAction());
+        group.addSeparator();
         group.add(new OpenConfigAction());
         group.add(new OpenInBrowserAction());
         group.add(new CopyPortAction());
@@ -157,6 +172,10 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
 
     private JPopupMenu buildPopupMenu() {
         DefaultActionGroup group = new DefaultActionGroup();
+        group.add(new StartAction());
+        group.add(new StopAction());
+        group.add(new RestartAction());
+        group.addSeparator();
         group.add(new OpenConfigAction());
         group.add(new OpenInBrowserAction());
         group.add(new CopyPortAction());
@@ -362,6 +381,182 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         }
     }
 
+    private final class StartAction extends PortsAction {
+        StartAction() {
+            super("启动", "运行该模块对应的运行配置", AllIcons.Actions.Execute);
+        }
+
+        @Override
+        public void update(@NotNull AnActionEvent e) {
+            ModulePortInfo selected = selectedRow();
+            e.getPresentation().setEnabled(selected != null
+                    && resolveConfigName(selected) != null
+                    && !isProcessRunning(selected));
+        }
+
+        @Override
+        public void actionPerformed(@NotNull AnActionEvent e) {
+            ModulePortInfo selected = selectedRow();
+            if (selected != null) {
+                startTarget(selected);
+            }
+        }
+    }
+
+    private final class StopAction extends PortsAction {
+        StopAction() {
+            super("停止", "终止该模块正在运行的进程", AllIcons.Process.Stop);
+        }
+
+        @Override
+        public void update(@NotNull AnActionEvent e) {
+            ModulePortInfo selected = selectedRow();
+            e.getPresentation().setEnabled(selected != null && isProcessRunning(selected));
+        }
+
+        @Override
+        public void actionPerformed(@NotNull AnActionEvent e) {
+            ModulePortInfo selected = selectedRow();
+            if (selected != null) {
+                stopTarget(selected);
+            }
+        }
+    }
+
+    private final class RestartAction extends PortsAction {
+        RestartAction() {
+            super("重启", "停止后自动重新启动（等待端口释放）", AllIcons.Actions.Restart);
+        }
+
+        @Override
+        public void update(@NotNull AnActionEvent e) {
+            ModulePortInfo selected = selectedRow();
+            e.getPresentation().setEnabled(selected != null
+                    && resolveConfigName(selected) != null);
+        }
+
+        @Override
+        public void actionPerformed(@NotNull AnActionEvent e) {
+            ModulePortInfo selected = selectedRow();
+            if (selected != null) {
+                restartTarget(selected);
+            }
+        }
+    }
+
+    // ----------------------------------------------------- start / stop / restart
+
+    /** Which run configuration the row's start/stop/restart should act on. */
+    @Nullable
+    private String resolveConfigName(@NotNull ModulePortInfo info) {
+        if (info.runConfigName() != null) {
+            return info.runConfigName(); // multi-instance row: its own configuration
+        }
+        // plain config-file row: the base instance is the module's config WITHOUT a port override
+        List<RunConfigReader.OverrideInfo> overrides = RunConfigReader
+                .readOverrides(project).getOrDefault(info.moduleName(), List.of());
+        List<String> all = RunConfigReader.configNamesForModule(project, info.moduleName());
+        for (String name : all) {
+            boolean hasOverride = false;
+            for (RunConfigReader.OverrideInfo override : overrides) {
+                if (override.configName().equals(name)) {
+                    hasOverride = true;
+                    break;
+                }
+            }
+            if (!hasOverride) {
+                return name;
+            }
+        }
+        return all.isEmpty() ? null : all.get(0);
+    }
+
+    private List<RunContentDescriptor> runningDescriptors() {
+        return ExecutionManager.getInstance(project).getContentManager().getAllDescriptors();
+    }
+
+    private boolean isProcessRunning(@NotNull ModulePortInfo info) {
+        String configName = resolveConfigName(info);
+        if (configName == null) {
+            return false;
+        }
+        for (RunContentDescriptor descriptor : runningDescriptors()) {
+            if (configName.equals(descriptor.getDisplayName())) {
+                ProcessHandler handler = descriptor.getProcessHandler();
+                if (handler != null && !handler.isProcessTerminated()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void startTarget(@NotNull ModulePortInfo info) {
+        String configName = resolveConfigName(info);
+        if (configName == null) {
+            statusLabel.setText("未找到可运行的配置（先在 IDEA 里运行一次生成配置）");
+            return;
+        }
+        RunnerAndConfigurationSettings settings = RunManager.getInstance(project).findConfigurationByName(configName);
+        if (settings == null) {
+            statusLabel.setText("运行配置已不存在: " + configName);
+            return;
+        }
+        Executor executor = DefaultRunExecutor.getRunExecutorInstance();
+        ProgramRunnerUtil.executeConfiguration(project, settings, executor);
+        statusLabel.setText("启动: " + configName);
+    }
+
+    private void stopTarget(@NotNull ModulePortInfo info) {
+        String configName = resolveConfigName(info);
+        if (configName == null) {
+            return;
+        }
+        boolean stopped = false;
+        for (RunContentDescriptor descriptor : runningDescriptors()) {
+            if (configName.equals(descriptor.getDisplayName())) {
+                ProcessHandler handler = descriptor.getProcessHandler();
+                if (handler != null && !handler.isProcessTerminated()) {
+                    handler.destroyProcess();
+                    stopped = true;
+                }
+            }
+        }
+        statusLabel.setText(stopped ? "停止: " + configName : "未在运行: " + configName);
+    }
+
+    private void restartTarget(@NotNull ModulePortInfo info) {
+        String configName = resolveConfigName(info);
+        if (configName == null) {
+            statusLabel.setText("未找到可运行的配置（先在 IDEA 里运行一次生成配置）");
+            return;
+        }
+        boolean stopped = false;
+        for (RunContentDescriptor descriptor : runningDescriptors()) {
+            if (configName.equals(descriptor.getDisplayName())) {
+                ProcessHandler handler = descriptor.getProcessHandler();
+                if (handler != null && !handler.isProcessTerminated()) {
+                    if (!stopped) { // only the first match schedules the restart
+                        handler.addProcessListener(new ProcessListener() {
+                            @Override
+                            public void processTerminated(@NotNull ProcessEvent event) {
+                                restartAlarm.cancelAllRequests();
+                                restartAlarm.addRequest(() -> startTarget(info), RESTART_DELAY_MS);
+                            }
+                        });
+                    }
+                    handler.destroyProcess();
+                    stopped = true;
+                }
+            }
+        }
+        if (!stopped) {
+            startTarget(info); // not running: plain start
+        } else {
+            statusLabel.setText("重启中: " + configName);
+        }
+    }
+
     private final class OpenConfigAction extends PortsAction {
         OpenConfigAction() {
             super("打开配置文件", "在编辑器中打开该端口所在的配置文件", AllIcons.FileTypes.Any_type);
@@ -441,5 +636,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     public void dispose() {
         refreshAlarm.cancelAllRequests();
         statusAlarm.cancelAllRequests();
+        restartAlarm.cancelAllRequests();
     }
 }

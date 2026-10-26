@@ -21,6 +21,8 @@ import org.jetbrains.annotations.Nullable;
  * @param moduleDir      module content root — clicking the module name reveals it in the Project view
  * @param buildFile      pom.xml / build.gradle(.kts) of the module, for one-click open
  * @param buildFileName  display name, kept for when the file gets invalidated
+ * @param runConfigName  run configuration this row was derived from (run-config rows only);
+ *                       the start/stop/restart actions target it
  */
 public record ModulePortInfo(
         String moduleName,
@@ -34,7 +36,8 @@ public record ModulePortInfo(
         @Nullable VirtualFile configFile,
         @Nullable VirtualFile moduleDir,
         @Nullable VirtualFile buildFile,
-        @Nullable String buildFileName) {
+        @Nullable String buildFileName,
+        @Nullable String runConfigName) {
 
     public static final int SPRING_BOOT_DEFAULT_PORT = 8080;
 
