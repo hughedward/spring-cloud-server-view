@@ -1,0 +1,26 @@
+<idea-plugin>
+    <id>com.ideaser.portviewer</id>
+    <name>Spring Cloud Port Viewer</name>
+    <vendor>ideaser</vendor>
+
+    <description><![CDATA[
+    Lists every module of a Spring Cloud / Spring Boot multi-module project together with the
+    <code>server.port</code> and context path parsed from its application/bootstrap configuration,
+    in a dedicated side tool window.<br/>
+    以列表形式展示 Spring Cloud 多模块项目中每个子模块的端口（server.port）与 context-path：
+    支持多 Profile、端口冲突高亮、双击打开配置文件、一键浏览器访问 localhost。
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.yaml</depends>
+
+    <idea-version since-build="242"/>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Ports"
+                    anchor="right"
+                    factoryClass="com.ideaser.portviewer.PortViewerToolWindowFactory"
+                    icon="/icons/portsToolWindow.svg"
+                    canCloseContents="false"/>
+    </extensions>
+</idea-plugin>
