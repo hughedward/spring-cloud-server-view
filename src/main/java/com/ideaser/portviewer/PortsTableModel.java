@@ -18,9 +18,10 @@ final class PortsTableModel extends AbstractTableModel {
     static final int STATUS_COLUMN = 4;
     static final int BUILD_FILE_COLUMN = 5;
     static final int CONFIG_FILE_COLUMN = 6;
+    static final int ACTIONS_COLUMN = 7;
 
     private static final String[] COLUMNS =
-            {"模块", "服务名", "Profile", "端口", "运行状态", "构建文件", "配置文件"};
+            {"模块", "服务名", "Profile", "端口", "运行状态", "构建文件", "配置文件", "操作"};
 
     private List<ModulePortInfo> rows = List.of();
     private Set<Integer> conflictPorts = Set.of();
@@ -103,6 +104,7 @@ final class PortsTableModel extends AbstractTableModel {
                     ? "" : (isRunning(info) ? "● 运行中" : "○ 未运行");
             case 5 -> info.buildFileName() == null ? "" : info.buildFileName();
             case 6 -> info.configFileName();
+            case ACTIONS_COLUMN -> ""; // painted by ActionsCellRenderer
             default -> "";
         };
     }

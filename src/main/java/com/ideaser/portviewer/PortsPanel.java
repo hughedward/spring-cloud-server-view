@@ -56,6 +56,7 @@ import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseMotionAdapter;
 import java.io.IOException;
 import java.net.URI;
 import java.util.List;
@@ -73,6 +74,7 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     private static final int MODULE_COLUMN = PortsTableModel.MODULE_COLUMN;
     private static final int BUILD_COLUMN = PortsTableModel.BUILD_FILE_COLUMN;
     private static final int CONFIG_COLUMN = PortsTableModel.CONFIG_FILE_COLUMN;
+    private static final int ACTIONS_COLUMN = PortsTableModel.ACTIONS_COLUMN;
 
     private final Project project;
     private final PortsTableModel model = new PortsTableModel();
@@ -115,6 +117,19 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         table.setStriped(true);
         table.getEmptyText().setText("未发现 Spring 配置文件（application*/bootstrap*）");
         setColumnWidths();
+        registerActionsCellRenderer();
+        table.addMouseMotionListener(new MouseMotionAdapter() {
+            @Override
+            public void mouseMoved(@NotNull MouseEvent e) {
+                int viewColumn = table.columnAtPoint(e.getPoint());
+                boolean overActions = viewColumn >= 0
+                        && table.convertColumnIndexToModel(viewColumn) == ACTIONS_COLUMN
+                        && table.rowAtPoint(e.getPoint()) >= 0;
+                table.setCursor(overActions
+                        ? Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                        : Cursor.getDefaultCursor());
+            }
+        });
         new TableSpeedSearch(table);
         table.addMouseListener(new MouseAdapter() {
             @Override
@@ -134,6 +149,7 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
                     case PORT_COLUMN -> openAndReveal(info.configFile(), "server", "port");
                     case BUILD_COLUMN -> openAndReveal(info.buildFile());
                     case CONFIG_COLUMN -> openAndReveal(info.configFile());
+                    case ACTIONS_COLUMN -> onActionsCellClick(info, e, viewRow, viewColumn);
                     default -> { /* Profile / 运行状态列：无对应跳转位置 */ }
                 }
             }
@@ -157,10 +173,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         DefaultActionGroup group = new DefaultActionGroup();
         group.add(new RefreshAction());
         group.addSeparator();
-        group.add(new StartAction());
-        group.add(new StopAction());
-        group.add(new RestartAction());
-        group.addSeparator();
         group.add(new OpenConfigAction());
         group.add(new OpenInBrowserAction());
         group.add(new CopyPortAction());
@@ -172,10 +184,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
 
     private JPopupMenu buildPopupMenu() {
         DefaultActionGroup group = new DefaultActionGroup();
-        group.add(new StartAction());
-        group.add(new StopAction());
-        group.add(new RestartAction());
-        group.addSeparator();
         group.add(new OpenConfigAction());
         group.add(new OpenInBrowserAction());
         group.add(new CopyPortAction());
@@ -185,9 +193,60 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     }
 
     private void setColumnWidths() {
-        int[] widths = {200, 150, 80, 110, 80, 120, 190};
+        int[] widths = {200, 150, 80, 110, 80, 120, 190, 100};
         for (int i = 0; i < widths.length && i < table.getColumnCount(); i++) {
             table.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
+        }
+    }
+
+    /** Attaches the ▶/■ + ↻ renderer to the actions column (survives column reordering). */
+    private void registerActionsCellRenderer() {
+        for (int i = 0; i < table.getColumnCount(); i++) {
+            javax.swing.table.TableColumn column = table.getColumnModel().getColumn(i);
+            if (column.getModelIndex() == ACTIONS_COLUMN) {
+                column.setCellRenderer(new ActionsCellRenderer());
+                return;
+            }
+        }
+    }
+
+    /** Left half of the cell = start/stop (icon follows run state), right half = restart. */
+    private void onActionsCellClick(@NotNull ModulePortInfo info,
+                                    @NotNull MouseEvent e,
+                                    int viewRow,
+                                    int viewColumn) {
+        Rectangle cell = table.getCellRect(viewRow, viewColumn, false);
+        boolean restartHit = cell.width > 0 && (e.getPoint().x - cell.x) >= cell.width / 2.0;
+        if (restartHit) {
+            restartTarget(info);
+        } else if (isProcessRunning(info)) {
+            stopTarget(info);
+        } else {
+            startTarget(info);
+        }
+    }
+
+    /** Paints ▶ (or ■ when the port is live) and ↻ centered in the cell. */
+    private final class ActionsCellRenderer extends JPanel implements javax.swing.table.TableCellRenderer {
+        private final JLabel primary = new JLabel();
+        private final JLabel restart = new JLabel(AllIcons.Actions.Restart);
+
+        ActionsCellRenderer() {
+            super(new FlowLayout(FlowLayout.CENTER, 18, 0));
+            add(primary);
+            add(restart);
+        }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable target, Object value, boolean selected,
+                                                       boolean focused, int row, int column) {
+            ModulePortInfo info = model.rowAt(target.convertRowIndexToModel(row));
+            boolean running = info.port() != null && model.isRunning(info);
+            primary.setIcon(running ? AllIcons.Process.Stop : AllIcons.Actions.Execute);
+            primary.setToolTipText(running ? "停止" : "启动");
+            restart.setToolTipText("重启");
+            setBackground(selected ? target.getSelectionBackground() : target.getBackground());
+            return this;
         }
     }
 
@@ -378,69 +437,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         @Override
         public void actionPerformed(@NotNull AnActionEvent e) {
             refresh();
-        }
-    }
-
-    private final class StartAction extends PortsAction {
-        StartAction() {
-            super("启动", "运行该模块对应的运行配置", AllIcons.Actions.Execute);
-        }
-
-        @Override
-        public void update(@NotNull AnActionEvent e) {
-            ModulePortInfo selected = selectedRow();
-            e.getPresentation().setEnabled(selected != null
-                    && resolveConfigName(selected) != null
-                    && !isProcessRunning(selected));
-        }
-
-        @Override
-        public void actionPerformed(@NotNull AnActionEvent e) {
-            ModulePortInfo selected = selectedRow();
-            if (selected != null) {
-                startTarget(selected);
-            }
-        }
-    }
-
-    private final class StopAction extends PortsAction {
-        StopAction() {
-            super("停止", "终止该模块正在运行的进程", AllIcons.Process.Stop);
-        }
-
-        @Override
-        public void update(@NotNull AnActionEvent e) {
-            ModulePortInfo selected = selectedRow();
-            e.getPresentation().setEnabled(selected != null && isProcessRunning(selected));
-        }
-
-        @Override
-        public void actionPerformed(@NotNull AnActionEvent e) {
-            ModulePortInfo selected = selectedRow();
-            if (selected != null) {
-                stopTarget(selected);
-            }
-        }
-    }
-
-    private final class RestartAction extends PortsAction {
-        RestartAction() {
-            super("重启", "停止后自动重新启动（等待端口释放）", AllIcons.Actions.Restart);
-        }
-
-        @Override
-        public void update(@NotNull AnActionEvent e) {
-            ModulePortInfo selected = selectedRow();
-            e.getPresentation().setEnabled(selected != null
-                    && resolveConfigName(selected) != null);
-        }
-
-        @Override
-        public void actionPerformed(@NotNull AnActionEvent e) {
-            ModulePortInfo selected = selectedRow();
-            if (selected != null) {
-                restartTarget(selected);
-            }
         }
     }
 
