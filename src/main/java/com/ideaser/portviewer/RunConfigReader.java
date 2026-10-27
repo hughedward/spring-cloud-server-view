@@ -83,22 +83,4 @@ final class RunConfigReader {
         }
         return null;
     }
-
-    /** All run configuration names belonging to the module, in RunManager order. */
-    @NotNull
-    static List<String> configNamesForModule(@NotNull Project project, @NotNull String moduleName) {
-        List<String> names = new ArrayList<>();
-        for (RunConfiguration configuration : RunManager.getInstance(project).getAllConfigurationsList()) {
-            Element xml = new Element("configuration");
-            try {
-                configuration.writeExternal(xml);
-            } catch (Exception e) {
-                continue; // exotic configuration types may fail to serialize — skip them
-            }
-            if (moduleName.equals(moduleName(xml))) {
-                names.add(configuration.getName());
-            }
-        }
-        return names;
-    }
 }

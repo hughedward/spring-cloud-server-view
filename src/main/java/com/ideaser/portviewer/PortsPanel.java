@@ -15,27 +15,16 @@ import com.intellij.openapi.ide.CopyPasteManager;
 import com.intellij.ProjectTopics;
 import com.intellij.execution.ExecutionListener;
 import com.intellij.execution.ExecutionManager;
-import com.intellij.execution.Executor;
-import com.intellij.execution.ProgramRunnerUtil;
-import com.intellij.execution.RunManager;
 import com.intellij.execution.RunManagerListener;
 import com.intellij.execution.RunnerAndConfigurationSettings;
-import com.intellij.execution.executors.DefaultRunExecutor;
-import com.intellij.execution.filters.TextConsoleBuilderFactory;
-import com.intellij.execution.process.ProcessEvent;
 import com.intellij.execution.process.ProcessHandler;
-import com.intellij.execution.process.ProcessListener;
 import com.intellij.execution.runners.ExecutionEnvironment;
-import com.intellij.execution.ui.ConsoleView;
-import com.intellij.execution.ui.RunContentDescriptor;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.roots.ModuleRootEvent;
 import com.intellij.openapi.roots.ModuleRootListener;
 import com.intellij.ide.projectView.ProjectView;
 import com.intellij.openapi.util.Disposer;
-import com.intellij.openapi.wm.ToolWindow;
-import com.intellij.openapi.wm.ToolWindowManager;
 import com.intellij.psi.PsiDirectory;
 import com.intellij.psi.PsiFile;
 import com.intellij.psi.PsiManager;
@@ -63,22 +52,15 @@ import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
-import java.awt.event.MouseMotionAdapter;
 import java.io.IOException;
 import java.net.URI;
-import java.util.HashSet;
-import java.util.IdentityHashMap;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 public final class PortsPanel extends SimpleToolWindowPanel implements Disposable {
 
     private static final int REFRESH_DEBOUNCE_MS = 400;
     private static final int STATUS_POLL_MS = 5000;
-    private static final int RESTART_DELAY_MS = 600;
     private static final JBColor RUNNING_GREEN = new JBColor(0x1E8E3E, 0x57C36A);
     private static final int APP_NAME_COLUMN = PortsTableModel.APP_NAME_COLUMN;
     private static final int PORT_COLUMN = PortsTableModel.PORT_COLUMN;
@@ -86,7 +68,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     private static final int MODULE_COLUMN = PortsTableModel.MODULE_COLUMN;
     private static final int BUILD_COLUMN = PortsTableModel.BUILD_FILE_COLUMN;
     private static final int CONFIG_COLUMN = PortsTableModel.CONFIG_FILE_COLUMN;
-    private static final int ACTIONS_COLUMN = PortsTableModel.ACTIONS_COLUMN;
 
     private final Project project;
     private final PortsTableModel model = new PortsTableModel();
@@ -116,13 +97,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     private final JBLabel statusLabel = new JBLabel("扫描中…");
     private final Alarm refreshAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
     private final Alarm statusAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
-    private final Alarm restartAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
-    private final Alarm focusAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
-    private final LogTab logTab = new LogTab();
-    /** config names with a live process — refreshed by the poller and execution events */
-    private Set<String> runningConfigNames = Set.of();
-    /** row → config it would start/stop; rebuilt after each scan (records use identity here) */
-    private final Map<ModulePortInfo, String> resolvedConfigCache = new IdentityHashMap<>();
 
     public PortsPanel(@NotNull Project project) {
         super(true, true);
@@ -135,19 +109,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         table.setStriped(true);
         table.getEmptyText().setText("未发现 Spring 配置文件（application*/bootstrap*）");
         setColumnWidths();
-        registerActionsCellRenderer();
-        table.addMouseMotionListener(new MouseMotionAdapter() {
-            @Override
-            public void mouseMoved(@NotNull MouseEvent e) {
-                int viewColumn = table.columnAtPoint(e.getPoint());
-                boolean overActions = viewColumn >= 0
-                        && table.convertColumnIndexToModel(viewColumn) == ACTIONS_COLUMN
-                        && table.rowAtPoint(e.getPoint()) >= 0;
-                table.setCursor(overActions
-                        ? Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                        : Cursor.getDefaultCursor());
-            }
-        });
         new TableSpeedSearch(table);
         table.addMouseListener(new MouseAdapter() {
             @Override
@@ -167,7 +128,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
                     case PORT_COLUMN -> openAndReveal(info.configFile(), "server", "port");
                     case BUILD_COLUMN -> openAndReveal(info.buildFile());
                     case CONFIG_COLUMN -> openAndReveal(info.configFile());
-                    case ACTIONS_COLUMN -> onActionsCellClick(info, e, viewRow, viewColumn);
                     default -> { /* Profile / 运行状态列：无对应跳转位置 */ }
                 }
             }
@@ -177,11 +137,7 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         root.add(ScrollPaneFactory.createScrollPane(table, true), BorderLayout.CENTER);
         statusLabel.setBorder(JBUI.Borders.empty(4, 8));
         root.add(statusLabel, BorderLayout.SOUTH);
-
-        JBTabbedPane tabs = new JBTabbedPane();
-        tabs.addTab("端口", root);
-        tabs.addTab("日志", logTab.build());
-        setContent(tabs);
+        setContent(root);
         setToolbar(buildToolbar().getComponent());
         setComponentPopupMenu(buildPopupMenu());
 
@@ -215,61 +171,9 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     }
 
     private void setColumnWidths() {
-        int[] widths = {200, 150, 80, 110, 80, 120, 190, 100};
+        int[] widths = {200, 150, 80, 110, 80, 120, 190};
         for (int i = 0; i < widths.length && i < table.getColumnCount(); i++) {
             table.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
-        }
-    }
-
-    /** Attaches the ▶/■ + ↻ renderer to the actions column (survives column reordering). */
-    private void registerActionsCellRenderer() {
-        for (int i = 0; i < table.getColumnCount(); i++) {
-            javax.swing.table.TableColumn column = table.getColumnModel().getColumn(i);
-            if (column.getModelIndex() == ACTIONS_COLUMN) {
-                column.setCellRenderer(new ActionsCellRenderer());
-                return;
-            }
-        }
-    }
-
-    /** Left half of the cell = start/stop (icon follows run state), right half = restart. */
-    private void onActionsCellClick(@NotNull ModulePortInfo info,
-                                    @NotNull MouseEvent e,
-                                    int viewRow,
-                                    int viewColumn) {
-        Rectangle cell = table.getCellRect(viewRow, viewColumn, false);
-        boolean restartHit = cell.width > 0 && (e.getPoint().x - cell.x) >= cell.width / 2.0;
-        if (restartHit) {
-            restartTarget(info);
-        } else if (isProcessRunning(info)) {
-            stopTarget(info);
-        } else {
-            startTarget(info);
-        }
-    }
-
-    /** Paints ▶ (or ■ when the port is live) and ↻ centered in the cell. */
-    private final class ActionsCellRenderer extends JPanel implements javax.swing.table.TableCellRenderer {
-        private final JLabel primary = new JLabel();
-        private final JLabel restart = new JLabel(AllIcons.Actions.Restart);
-
-        ActionsCellRenderer() {
-            super(new FlowLayout(FlowLayout.CENTER, 18, 0));
-            add(primary);
-            add(restart);
-        }
-
-        @Override
-        public Component getTableCellRendererComponent(JTable target, Object value, boolean selected,
-                                                       boolean focused, int row, int column) {
-            ModulePortInfo info = model.rowAt(target.convertRowIndexToModel(row));
-            // port listening OR live process (covers the starting phase before the port opens)
-            boolean running = (info.port() != null && model.isRunning(info)) || isRowProcessRunning(info);
-            primary.setIcon(running ? AllIcons.Process.Stop : AllIcons.Actions.Execute);
-            primary.setToolTipText(running ? "停止" : "启动");
-            restart.setToolTipText("重启");
-            setBackground(selected ? target.getSelectionBackground() : target.getBackground());
-            return this;
         }
     }
 
@@ -286,7 +190,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
                         return;
                     }
                     model.update(rows);
-                    buildResolvedConfigCache();
                     updateStatusLabel();
                     pollStatusNow(); // liveness reflects the fresh rows immediately
                 })
@@ -321,8 +224,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
                     return;
                 }
                 model.updateRunning(listening);
-                runningConfigNames = collectRunningConfigNames();
-                logTab.sync(runningDescriptors());
                 updateStatusLabel();
             }, ModalityState.any());
             scheduleNextStatusPoll();
@@ -397,30 +298,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         });
     }
 
-    private void buildResolvedConfigCache() {
-        resolvedConfigCache.clear();
-        for (int i = 0; i < model.getRowCount(); i++) {
-            ModulePortInfo info = model.rowAt(i);
-            resolvedConfigCache.put(info, resolveConfigName(info));
-        }
-    }
-
-    private Set<String> collectRunningConfigNames() {
-        Set<String> names = new HashSet<>();
-        for (RunContentDescriptor descriptor : runningDescriptors()) {
-            ProcessHandler handler = descriptor.getProcessHandler();
-            if (handler != null && !handler.isProcessTerminated()) {
-                names.add(descriptor.getDisplayName());
-            }
-        }
-        return names;
-    }
-
-    /** True when the row's run configuration has a live process (starting counts too). */
-    private boolean isRowProcessRunning(@NotNull ModulePortInfo info) {
-        String configName = resolvedConfigCache.getOrDefault(info, resolveConfigName(info));
-        return configName != null && runningConfigNames.contains(configName);
-    }
 
     // ------------------------------------------------------------------- actions
 
@@ -510,130 +387,6 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         }
     }
 
-    // ----------------------------------------------------- start / stop / restart
-
-    /** Which run configuration the row's start/stop/restart should act on. */
-    @Nullable
-    private String resolveConfigName(@NotNull ModulePortInfo info) {
-        if (info.runConfigName() != null) {
-            return info.runConfigName(); // multi-instance row: its own configuration
-        }
-        // plain config-file row: the base instance is the module's config WITHOUT a port override
-        List<RunConfigReader.OverrideInfo> overrides = RunConfigReader
-                .readOverrides(project).getOrDefault(info.moduleName(), List.of());
-        List<String> all = RunConfigReader.configNamesForModule(project, info.moduleName());
-        for (String name : all) {
-            boolean hasOverride = false;
-            for (RunConfigReader.OverrideInfo override : overrides) {
-                if (override.configName().equals(name)) {
-                    hasOverride = true;
-                    break;
-                }
-            }
-            if (!hasOverride) {
-                return name;
-            }
-        }
-        return all.isEmpty() ? null : all.get(0);
-    }
-
-    private List<RunContentDescriptor> runningDescriptors() {
-        return ExecutionManager.getInstance(project).getContentManager().getAllDescriptors();
-    }
-
-    private boolean isProcessRunning(@NotNull ModulePortInfo info) {
-        String configName = resolveConfigName(info);
-        if (configName == null) {
-            return false;
-        }
-        for (RunContentDescriptor descriptor : runningDescriptors()) {
-            if (configName.equals(descriptor.getDisplayName())) {
-                ProcessHandler handler = descriptor.getProcessHandler();
-                if (handler != null && !handler.isProcessTerminated()) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private void startTarget(@NotNull ModulePortInfo info) {
-        String configName = resolveConfigName(info);
-        if (configName == null) {
-            statusLabel.setText("未找到可运行的配置（先在 IDEA 里运行一次生成配置）");
-            return;
-        }
-        RunnerAndConfigurationSettings settings = RunManager.getInstance(project).findConfigurationByName(configName);
-        if (settings == null) {
-            statusLabel.setText("运行配置已不存在: " + configName);
-            return;
-        }
-        Executor executor = DefaultRunExecutor.getRunExecutorInstance();
-        ProgramRunnerUtil.executeConfiguration(project, settings, executor);
-        statusLabel.setText("启动: " + configName);
-        // pull focus back into this panel — Run tool window would otherwise grab it
-        focusAlarm.cancelAllRequests();
-        focusAlarm.addRequest(() -> {
-            if (project.isDisposed()) {
-                return;
-            }
-            ToolWindow ports = ToolWindowManager.getInstance(project).getToolWindow("Ports");
-            if (ports != null) {
-                ports.activate(null);
-            }
-        }, 300);
-    }
-
-    private void stopTarget(@NotNull ModulePortInfo info) {
-        String configName = resolveConfigName(info);
-        if (configName == null) {
-            return;
-        }
-        boolean stopped = false;
-        for (RunContentDescriptor descriptor : runningDescriptors()) {
-            if (configName.equals(descriptor.getDisplayName())) {
-                ProcessHandler handler = descriptor.getProcessHandler();
-                if (handler != null && !handler.isProcessTerminated()) {
-                    handler.destroyProcess();
-                    stopped = true;
-                }
-            }
-        }
-        statusLabel.setText(stopped ? "停止: " + configName : "未在运行: " + configName);
-    }
-
-    private void restartTarget(@NotNull ModulePortInfo info) {
-        String configName = resolveConfigName(info);
-        if (configName == null) {
-            statusLabel.setText("未找到可运行的配置（先在 IDEA 里运行一次生成配置）");
-            return;
-        }
-        boolean stopped = false;
-        for (RunContentDescriptor descriptor : runningDescriptors()) {
-            if (configName.equals(descriptor.getDisplayName())) {
-                ProcessHandler handler = descriptor.getProcessHandler();
-                if (handler != null && !handler.isProcessTerminated()) {
-                    if (!stopped) { // only the first match schedules the restart
-                        handler.addProcessListener(new ProcessListener() {
-                            @Override
-                            public void processTerminated(@NotNull ProcessEvent event) {
-                                restartAlarm.cancelAllRequests();
-                                restartAlarm.addRequest(() -> startTarget(info), RESTART_DELAY_MS);
-                            }
-                        });
-                    }
-                    handler.destroyProcess();
-                    stopped = true;
-                }
-            }
-        }
-        if (!stopped) {
-            startTarget(info); // not running: plain start
-        } else {
-            statusLabel.setText("重启中: " + configName);
-        }
-    }
-
     private final class OpenConfigAction extends PortsAction {
         OpenConfigAction() {
             super("打开配置文件", "在编辑器中打开该端口所在的配置文件", AllIcons.FileTypes.Any_type);
@@ -709,92 +462,9 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
 
     // ------------------------------------------------------------------- dispose
 
-    // ------------------------------------------------------------------- log tab
-
-    /**
-     * "日志" tab: embedded console per running configuration, switched by a
-     * combo box. Consoles attach to the live process handlers and stream
-     * output from the moment of attachment.
-     */
-    private final class LogTab {
-        private static final String HINT_CARD = "__hint__";
-
-        private final JComboBox<String> combo = new JComboBox<>();
-        private final JPanel cards = new JPanel(new CardLayout());
-        private final Map<String, ConsoleView> consoles = new LinkedHashMap<>();
-        private final JPanel root = new JPanel(new BorderLayout());
-
-        LogTab() {
-            combo.addItemListener(event -> {
-                Object item = combo.getSelectedItem();
-                if (item != null) {
-                    ((CardLayout) cards.getLayout()).show(cards, item.toString());
-                }
-            });
-            combo.setEnabled(false);
-            cards.add(new JBLabel("启动任意服务后，这里会显示它的控制台输出"), HINT_CARD);
-            root.add(combo, BorderLayout.NORTH);
-            root.add(cards, BorderLayout.CENTER);
-        }
-
-        JComponent build() {
-            return root;
-        }
-
-        void sync(@NotNull List<RunContentDescriptor> descriptors) {
-            List<String> names = new java.util.ArrayList<>();
-            for (RunContentDescriptor descriptor : descriptors) {
-                ProcessHandler handler = descriptor.getProcessHandler();
-                if (handler == null || handler.isProcessTerminated()) {
-                    continue;
-                }
-                String name = descriptor.getDisplayName();
-                names.add(name);
-                if (!consoles.containsKey(name)) {
-                    ConsoleView console = TextConsoleBuilderFactory.getInstance()
-                            .createBuilder(project).getConsole();
-                    console.attachToProcess(handler);
-                    consoles.put(name, console);
-                    Disposer.register(PortsPanel.this, console);
-                    cards.add(console.getComponent(), name);
-                }
-            }
-            Iterator<Map.Entry<String, ConsoleView>> entryIterator = consoles.entrySet().iterator();
-            while (entryIterator.hasNext()) {
-                Map.Entry<String, ConsoleView> entry = entryIterator.next();
-                if (!names.contains(entry.getKey())) {
-                    cards.remove(entry.getValue().getComponent());
-                    Disposer.dispose(entry.getValue());
-                    entryIterator.remove();
-                }
-            }
-            CardLayout layout = (CardLayout) cards.getLayout();
-            if (names.isEmpty()) {
-                combo.removeAllItems();
-                combo.setEnabled(false);
-                layout.show(cards, HINT_CARD);
-                return;
-            }
-            Object selected = combo.getSelectedItem();
-            combo.removeAllItems();
-            for (String name : names) {
-                combo.addItem(name);
-            }
-            if (selected != null && names.contains(selected.toString())) {
-                combo.setSelectedItem(selected);
-            } else {
-                combo.setSelectedIndex(0);
-            }
-            combo.setEnabled(true);
-            layout.show(cards, String.valueOf(combo.getSelectedItem()));
-        }
-    }
-
     @Override
     public void dispose() {
         refreshAlarm.cancelAllRequests();
         statusAlarm.cancelAllRequests();
-        restartAlarm.cancelAllRequests();
-        focusAlarm.cancelAllRequests();
     }
 }
