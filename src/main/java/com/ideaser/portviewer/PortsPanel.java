@@ -13,6 +13,7 @@ import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.fileEditor.OpenFileDescriptor;
 import com.intellij.openapi.ide.CopyPasteManager;
 import com.intellij.ProjectTopics;
+import com.intellij.execution.ExecutionListener;
 import com.intellij.execution.ExecutionManager;
 import com.intellij.execution.Executor;
 import com.intellij.execution.ProgramRunnerUtil;
@@ -20,9 +21,12 @@ import com.intellij.execution.RunManager;
 import com.intellij.execution.RunManagerListener;
 import com.intellij.execution.RunnerAndConfigurationSettings;
 import com.intellij.execution.executors.DefaultRunExecutor;
+import com.intellij.execution.filters.TextConsoleBuilderFactory;
 import com.intellij.execution.process.ProcessEvent;
 import com.intellij.execution.process.ProcessHandler;
 import com.intellij.execution.process.ProcessListener;
+import com.intellij.execution.runners.ExecutionEnvironment;
+import com.intellij.execution.ui.ConsoleView;
 import com.intellij.execution.ui.RunContentDescriptor;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.project.Project;
@@ -30,6 +34,8 @@ import com.intellij.openapi.roots.ModuleRootEvent;
 import com.intellij.openapi.roots.ModuleRootListener;
 import com.intellij.ide.projectView.ProjectView;
 import com.intellij.openapi.util.Disposer;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowManager;
 import com.intellij.psi.PsiDirectory;
 import com.intellij.psi.PsiFile;
 import com.intellij.psi.PsiManager;
@@ -42,6 +48,7 @@ import com.intellij.ui.JBColor;
 import com.intellij.ui.ScrollPaneFactory;
 import com.intellij.ui.TableSpeedSearch;
 import com.intellij.ui.components.JBLabel;
+import com.intellij.ui.components.JBTabbedPane;
 import com.intellij.ui.table.JBTable;
 import com.intellij.util.Alarm;
 import com.intellij.util.concurrency.AppExecutorUtil;
@@ -59,7 +66,12 @@ import java.awt.event.MouseEvent;
 import java.awt.event.MouseMotionAdapter;
 import java.io.IOException;
 import java.net.URI;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public final class PortsPanel extends SimpleToolWindowPanel implements Disposable {
@@ -105,6 +117,12 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
     private final Alarm refreshAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
     private final Alarm statusAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
     private final Alarm restartAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
+    private final Alarm focusAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
+    private final LogTab logTab = new LogTab();
+    /** config names with a live process — refreshed by the poller and execution events */
+    private Set<String> runningConfigNames = Set.of();
+    /** row → config it would start/stop; rebuilt after each scan (records use identity here) */
+    private final Map<ModulePortInfo, String> resolvedConfigCache = new IdentityHashMap<>();
 
     public PortsPanel(@NotNull Project project) {
         super(true, true);
@@ -159,7 +177,11 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         root.add(ScrollPaneFactory.createScrollPane(table, true), BorderLayout.CENTER);
         statusLabel.setBorder(JBUI.Borders.empty(4, 8));
         root.add(statusLabel, BorderLayout.SOUTH);
-        setContent(root);
+
+        JBTabbedPane tabs = new JBTabbedPane();
+        tabs.addTab("端口", root);
+        tabs.addTab("日志", logTab.build());
+        setContent(tabs);
         setToolbar(buildToolbar().getComponent());
         setComponentPopupMenu(buildPopupMenu());
 
@@ -241,7 +263,8 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         public Component getTableCellRendererComponent(JTable target, Object value, boolean selected,
                                                        boolean focused, int row, int column) {
             ModulePortInfo info = model.rowAt(target.convertRowIndexToModel(row));
-            boolean running = info.port() != null && model.isRunning(info);
+            // port listening OR live process (covers the starting phase before the port opens)
+            boolean running = (info.port() != null && model.isRunning(info)) || isRowProcessRunning(info);
             primary.setIcon(running ? AllIcons.Process.Stop : AllIcons.Actions.Execute);
             primary.setToolTipText(running ? "停止" : "启动");
             restart.setToolTipText("重启");
@@ -263,6 +286,7 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
                         return;
                     }
                     model.update(rows);
+                    buildResolvedConfigCache();
                     updateStatusLabel();
                     pollStatusNow(); // liveness reflects the fresh rows immediately
                 })
@@ -297,6 +321,8 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
                     return;
                 }
                 model.updateRunning(listening);
+                runningConfigNames = collectRunningConfigNames();
+                logTab.sync(runningDescriptors());
                 updateStatusLabel();
             }, ModalityState.any());
             scheduleNextStatusPoll();
@@ -350,6 +376,50 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
                 scheduleRefresh(); // -Dserver.port overrides may have changed
             }
         });
+        // instant state sync in BOTH directions: native run/stop buttons and our own
+        connection.subscribe(ExecutionManager.EXECUTION_TOPIC, new ExecutionListener() {
+            @Override
+            public void processStarted(@NotNull String executorId,
+                                       @NotNull ExecutionEnvironment environment,
+                                       @NotNull ProcessHandler handler) {
+                ApplicationManager.getApplication().invokeLater(PortsPanel.this::pollStatusNow,
+                        ModalityState.any());
+            }
+
+            @Override
+            public void processTerminated(@NotNull String executorId,
+                                          @NotNull ExecutionEnvironment environment,
+                                          @NotNull ProcessHandler handler,
+                                          int exitCode) {
+                ApplicationManager.getApplication().invokeLater(PortsPanel.this::pollStatusNow,
+                        ModalityState.any());
+            }
+        });
+    }
+
+    private void buildResolvedConfigCache() {
+        resolvedConfigCache.clear();
+        for (int i = 0; i < model.getRowCount(); i++) {
+            ModulePortInfo info = model.rowAt(i);
+            resolvedConfigCache.put(info, resolveConfigName(info));
+        }
+    }
+
+    private Set<String> collectRunningConfigNames() {
+        Set<String> names = new HashSet<>();
+        for (RunContentDescriptor descriptor : runningDescriptors()) {
+            ProcessHandler handler = descriptor.getProcessHandler();
+            if (handler != null && !handler.isProcessTerminated()) {
+                names.add(descriptor.getDisplayName());
+            }
+        }
+        return names;
+    }
+
+    /** True when the row's run configuration has a live process (starting counts too). */
+    private boolean isRowProcessRunning(@NotNull ModulePortInfo info) {
+        String configName = resolvedConfigCache.getOrDefault(info, resolveConfigName(info));
+        return configName != null && runningConfigNames.contains(configName);
     }
 
     // ------------------------------------------------------------------- actions
@@ -501,6 +571,17 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
         Executor executor = DefaultRunExecutor.getRunExecutorInstance();
         ProgramRunnerUtil.executeConfiguration(project, settings, executor);
         statusLabel.setText("启动: " + configName);
+        // pull focus back into this panel — Run tool window would otherwise grab it
+        focusAlarm.cancelAllRequests();
+        focusAlarm.addRequest(() -> {
+            if (project.isDisposed()) {
+                return;
+            }
+            ToolWindow ports = ToolWindowManager.getInstance(project).getToolWindow("Ports");
+            if (ports != null) {
+                ports.activate(null);
+            }
+        }, 300);
     }
 
     private void stopTarget(@NotNull ModulePortInfo info) {
@@ -628,10 +709,92 @@ public final class PortsPanel extends SimpleToolWindowPanel implements Disposabl
 
     // ------------------------------------------------------------------- dispose
 
+    // ------------------------------------------------------------------- log tab
+
+    /**
+     * "日志" tab: embedded console per running configuration, switched by a
+     * combo box. Consoles attach to the live process handlers and stream
+     * output from the moment of attachment.
+     */
+    private final class LogTab {
+        private static final String HINT_CARD = "__hint__";
+
+        private final JComboBox<String> combo = new JComboBox<>();
+        private final JPanel cards = new JPanel(new CardLayout());
+        private final Map<String, ConsoleView> consoles = new LinkedHashMap<>();
+        private final JPanel root = new JPanel(new BorderLayout());
+
+        LogTab() {
+            combo.addItemListener(event -> {
+                Object item = combo.getSelectedItem();
+                if (item != null) {
+                    ((CardLayout) cards.getLayout()).show(cards, item.toString());
+                }
+            });
+            combo.setEnabled(false);
+            cards.add(new JBLabel("启动任意服务后，这里会显示它的控制台输出"), HINT_CARD);
+            root.add(combo, BorderLayout.NORTH);
+            root.add(cards, BorderLayout.CENTER);
+        }
+
+        JComponent build() {
+            return root;
+        }
+
+        void sync(@NotNull List<RunContentDescriptor> descriptors) {
+            List<String> names = new java.util.ArrayList<>();
+            for (RunContentDescriptor descriptor : descriptors) {
+                ProcessHandler handler = descriptor.getProcessHandler();
+                if (handler == null || handler.isProcessTerminated()) {
+                    continue;
+                }
+                String name = descriptor.getDisplayName();
+                names.add(name);
+                if (!consoles.containsKey(name)) {
+                    ConsoleView console = TextConsoleBuilderFactory.getInstance()
+                            .createBuilder(project).getConsole();
+                    console.attachToProcess(handler);
+                    consoles.put(name, console);
+                    Disposer.register(PortsPanel.this, console);
+                    cards.add(console.getComponent(), name);
+                }
+            }
+            Iterator<Map.Entry<String, ConsoleView>> entryIterator = consoles.entrySet().iterator();
+            while (entryIterator.hasNext()) {
+                Map.Entry<String, ConsoleView> entry = entryIterator.next();
+                if (!names.contains(entry.getKey())) {
+                    cards.remove(entry.getValue().getComponent());
+                    Disposer.dispose(entry.getValue());
+                    entryIterator.remove();
+                }
+            }
+            CardLayout layout = (CardLayout) cards.getLayout();
+            if (names.isEmpty()) {
+                combo.removeAllItems();
+                combo.setEnabled(false);
+                layout.show(cards, HINT_CARD);
+                return;
+            }
+            Object selected = combo.getSelectedItem();
+            combo.removeAllItems();
+            for (String name : names) {
+                combo.addItem(name);
+            }
+            if (selected != null && names.contains(selected.toString())) {
+                combo.setSelectedItem(selected);
+            } else {
+                combo.setSelectedIndex(0);
+            }
+            combo.setEnabled(true);
+            layout.show(cards, String.valueOf(combo.getSelectedItem()));
+        }
+    }
+
     @Override
     public void dispose() {
         refreshAlarm.cancelAllRequests();
         statusAlarm.cancelAllRequests();
         restartAlarm.cancelAllRequests();
+        focusAlarm.cancelAllRequests();
     }
 }
