@@ -3,6 +3,8 @@
 在 IntelliJ IDEA 侧边栏以列表形式展示 Spring Cloud / Spring Boot 多模块项目中
 **每个子模块的端口（`server.port`）与 context-path**，并检测**服务是否在运行**，
 不用再逐个打开配置文件对端口。
+<img width="1882" height="283" alt="image" src="https://github.com/user-attachments/assets/0a4c5840-3cc6-4f5f-9506-b51085deefec" />
+
 
 **版本要求：IDEA 2025.2（build 252）及以上，无上限。**
 
